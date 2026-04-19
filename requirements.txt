@@ -1,0 +1,19 @@
+# PyTorch: install from PyPI on macOS (CPU/MPS). On Linux + NVIDIA, use CUDA wheels from pytorch.org if needed.
+torch>=2.0
+torchvision
+torchaudio
+transformers
+datasets
+torchcodec
+scikit-learn
+scipy
+numpy
+ipykernel
+jupyter
+jupyterlab
+jupyterlab-widgets
+jupyterlab-code-formatter
+jupyterlab-code-snippets
+streamlit
+matplotlib
+seaborn

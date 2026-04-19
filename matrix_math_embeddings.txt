@@ -1,0 +1,313 @@
+================================================================================
+  MATRIX MULTIPLICATION & UPDATED WEIGHTS IN SPEAKER EMBEDDING GENERATION
+  Project: wav2vec2-large-xlsr-53 + AAM-Softmax
+  Generated: 2026-04-20
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+  OVERVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+  This document traces a single audio clip through every mathematical operation
+  from raw waveform → 256-dim L2-normalized speaker embedding, explaining
+  exactly where matrix multiplications happen, which weights are frozen vs.
+  fine-tuned, and how those updated numbers change the final output.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 0 — INPUT
+────────────────────────────────────────────────────────────────────────────────
+
+  Raw waveform:
+    x ∈ ℝ^32000     (2 seconds × 16,000 Hz = 32,000 samples)
+    Each element is a floating-point amplitude value between -1 and 1.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 1 — CNN FEATURE EXTRACTOR  [❄️ Frozen]
+────────────────────────────────────────────────────────────────────────────────
+
+  7 convolutional layers compress the raw waveform into frames.
+
+  Operation per layer:
+    h[t] = Σ  W_conv[k] · x[t·stride + k]     for each filter k
+           k
+
+  Total stride = 320 across all 7 layers.
+  At 16,000 Hz:  32,000 / 320 = 100 frames
+
+  Output:
+    H ∈ ℝ^(100 × 512)     (100 frames, 512-dim each, one frame = 20 ms)
+
+  Status:  FROZEN — W_conv never changed during fine-tuning.
+  Purpose: Extracts raw acoustic features — energy, pitch contours, formants.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 2 — LINEAR PROJECTION INTO TRANSFORMER SPACE  [❄️ Frozen]
+────────────────────────────────────────────────────────────────────────────────
+
+  Lifts each frame from 512-dim to 1024-dim (Transformer hidden size).
+
+  Operation:
+    H_proj = H · W_proj  +  b_proj
+
+    H       ∈ ℝ^(100 × 512)
+    W_proj  ∈ ℝ^(512 × 1024)
+    ──────────────────────────
+    Result  ∈ ℝ^(100 × 1024)
+
+  Status:  FROZEN
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 3 — TRANSFORMER LAYERS 1–20  [❄️ Frozen]
+────────────────────────────────────────────────────────────────────────────────
+
+  Each of the 20 layers performs the same 3 operations.
+  Tracking one layer (input H ∈ ℝ^(100 × 1024)):
+
+  ── 3A. Self-Attention ──────────────────────────────────────────────────────
+
+    Q = H · W_Q          (Query)        W_Q ∈ ℝ^(1024 × 1024)
+    K = H · W_K          (Key)          W_K ∈ ℝ^(1024 × 1024)
+    V = H · W_V          (Value)        W_V ∈ ℝ^(1024 × 1024)
+
+    Attention scores:
+      A = softmax( Q · Kᵀ / √64 )      A ∈ ℝ^(100 × 100)
+                         ↑
+                   √(head_dim) = √(1024 / 16 heads) = √64
+
+    Attended output:
+      Z = A · V                         Z ∈ ℝ^(100 × 1024)
+
+    Meaning: Every frame "looks at" all other frames.
+             Frame 50 can borrow context from frame 10.
+
+  ── 3B. Feed-Forward Network ────────────────────────────────────────────────
+
+    FFN(Z) = ReLU( Z · W_1 + b_1 ) · W_2 + b_2
+
+    W_1 ∈ ℝ^(1024 × 4096)    ← expand
+    W_2 ∈ ℝ^(4096 × 1024)    ← compress back
+
+  ── 3C. Residual + LayerNorm ────────────────────────────────────────────────
+
+    H_out = LayerNorm( H + Z )
+    H_out = LayerNorm( H_out + FFN(H_out) )
+
+  Status:  FROZEN — W_Q, W_K, W_V, W_1, W_2 are original pretrained values.
+  Purpose: These layers encode phonetic and acoustic structure of speech.
+           They know what sounds like what — not who sounds like who.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 4 — TRANSFORMER LAYERS 21–24  [🔥 Fine-tuned ← KEY STEP]
+────────────────────────────────────────────────────────────────────────────────
+
+  SAME mathematical operations as Step 3 — but the weight matrices
+  contain DIFFERENT numbers from what pretraining left them at.
+
+  Before fine-tuning, layer 21's W_Q encoded:
+    "How much does frame i's phoneme context
+     relate to frame j's phoneme context?"
+
+  After fine-tuning, layer 21's W_Q encodes:
+    "How much does frame i's SPEAKER characteristic
+     relate to frame j's SPEAKER characteristic?"
+
+  How the weights changed — gradient descent:
+    W_new = W_old  -  lr · ∂Loss/∂W
+
+    ∂Loss/∂W flows backward from AAM-Softmax
+    → through Projection Head
+    → through Attentive Pool
+    → through Layers 24 → 23 → 22 → 21
+
+  Over 7,500 gradient steps (750 batches × 10 epochs), each tiny update
+  nudged W_Q, W_K, W_V, W_1, W_2 in these 4 layers to make their
+  attention patterns SPEAKER-SELECTIVE:
+
+    Vowel frames (carry speaker identity)   → high attention scores
+    Silence / noise frames                  → near-zero attention scores
+    Consonant frames                        → moderate attention scores
+
+  Status:  FINE-TUNED — weights shifted from phoneme-focus to speaker-focus.
+  Output:  H ∈ ℝ^(100 × 1024)   (same shape, different content)
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 5 — ATTENTIVE STATISTICS POOLING  [🔥 Fine-tuned]
+────────────────────────────────────────────────────────────────────────────────
+
+  Input:  H ∈ ℝ^(100 × 1024)    — 100 frames, each 1024-dim
+
+  ── Attention Scores ────────────────────────────────────────────────────────
+
+    e = H  · W_a1              W_a1 ∈ ℝ^(1024 × 128)    e ∈ ℝ^(100 × 128)
+    e = tanh(e)
+    e = e  · W_a2              W_a2 ∈ ℝ^(128 × 1)       e ∈ ℝ^(100 × 1)
+    α = softmax(e)                                        α ∈ ℝ^(100 × 1)
+        ↑
+    α[t] = how important is frame t for speaker identity
+
+  ── Weighted Mean ───────────────────────────────────────────────────────────
+
+    μ = αᵀ · H  =  Σ α[t] · H[t]    for t = 1..100       μ ∈ ℝ^(1 × 1024)
+
+  ── Weighted Standard Deviation ─────────────────────────────────────────────
+
+    σ² = Σ α[t] · ( H[t] - μ )²
+    σ  = sqrt(σ²)                                          σ ∈ ℝ^(1 × 1024)
+
+  ── Concatenate ─────────────────────────────────────────────────────────────
+
+    out = [ μ | σ ]                                        out ∈ ℝ^(1 × 2048)
+
+  Concrete α values for a typical 2-second clip:
+    Silence frames    →  α ≈ 0.002
+    Vowel frames      →  α ≈ 0.025
+    Consonant frames  →  α ≈ 0.010
+
+  Status:  FINE-TUNED — W_a1, W_a2 learned to weight speaker-rich frames.
+  Purpose: Collapses variable-length sequence into fixed-size summary.
+           μ captures the speaker's central tendency on the hypersphere.
+           σ captures speaking style variation across frames.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 6 — PROJECTION HEAD  [🔥 Fine-tuned]
+────────────────────────────────────────────────────────────────────────────────
+
+  Compresses 2048-dim pooled representation into final 256-dim embedding space.
+
+  ── Layer 1 ─────────────────────────────────────────────────────────────────
+
+    z1 = out · W_p1  +  b_p1       W_p1 ∈ ℝ^(2048 × 512)
+    z1 = BatchNorm(z1)              normalizes scale across the batch
+    z1 = ReLU(z1)                   kills negatives, preserves structure
+    z1 ∈ ℝ^512
+
+  ── Layer 2 ─────────────────────────────────────────────────────────────────
+
+    z2 = z1 · W_p2  +  b_p2       W_p2 ∈ ℝ^(512 × 256)
+    z2 ∈ ℝ^256
+
+  Status:  FINE-TUNED — W_p1, W_p2 learned to arrange the 256-dim space
+           such that intra-speaker distance is minimized and
+           inter-speaker distance is maximized.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 7 — L2 NORMALIZATION
+────────────────────────────────────────────────────────────────────────────────
+
+    ||z2||₂ = sqrt( z2[0]² + z2[1]² + ... + z2[255]² )
+
+    v = z2 / ||z2||₂
+
+    Result:  ||v|| = 1   always
+             v ∈ ℝ^256,  lives exactly on the surface of a unit hypersphere
+
+  Why this matters:
+    Without normalization, vector magnitude also carries information (noise).
+    After normalization, ONLY DIRECTION matters.
+    AAM-Softmax uses cos(θ) everywhere — it is designed for the unit sphere.
+    L2 norm is not an afterthought; training directly optimizes direction.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  STEP 8 — COSINE SIMILARITY AT VERIFICATION
+────────────────────────────────────────────────────────────────────────────────
+
+  For two audio clips A and B:
+    emb_A = v_A ∈ ℝ^256,   ||v_A|| = 1
+    emb_B = v_B ∈ ℝ^256,   ||v_B|| = 1
+
+    score = v_A · v_Bᵀ  =  Σ v_A[i] · v_B[i]     for i = 0..255
+                            ↑
+              dot product = cosine similarity  (since both are unit vectors)
+
+    score ∈ [-1.0, 1.0]
+
+    Same speaker      →  embeddings point same direction  →  score ≈ 0.71
+    Different speaker →  embeddings point apart           →  score ≈ 0.37
+
+    Decision:
+      score ≥ threshold (~0.54)  →  ✅  Same speaker
+      score <  threshold         →  ❌  Different speaker
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FULL MATHEMATICAL PIPELINE — SUMMARY
+────────────────────────────────────────────────────────────────────────────────
+
+  x ∈ ℝ^32000
+    │
+    │  W_conv            ← FROZEN    extracts acoustic features
+    ↓
+  H ∈ ℝ^(100 × 512)
+    │
+    │  W_proj            ← FROZEN    lifts to transformer space
+    ↓
+  H ∈ ℝ^(100 × 1024)
+    │
+    │  W_Q, W_K, W_V     ← FROZEN    phoneme-focused attention
+    │  W_1, W_2          ← FROZEN    (layers 1–20, unchanged from pretraining)
+    ↓
+  H ∈ ℝ^(100 × 1024)
+    │
+    │  W_Q, W_K, W_V     ← FINE-TUNED   speaker-focused attention
+    │  W_1, W_2          ← FINE-TUNED   (layers 21–24, shifted by 7,500 steps)
+    ↓
+  H ∈ ℝ^(100 × 1024)
+    │
+    │  W_a1, W_a2        ← FINE-TUNED   frame importance weights
+    ↓
+  [μ | σ] ∈ ℝ^2048
+    │
+    │  W_p1, W_p2        ← FINE-TUNED   compress to embedding space
+    ↓
+  z ∈ ℝ^256
+    │
+    │  / ||z||₂          ← project onto unit sphere
+    ↓
+  v ∈ ℝ^256,  ||v|| = 1                 ←  FINAL SPEAKER EMBEDDING
+
+  dot(v_A, v_B)  →  similarity score  →  threshold  →  Same / Different
+
+
+────────────────────────────────────────────────────────────────────────────────
+  WHAT FINE-TUNING CHANGED — CONCRETELY
+────────────────────────────────────────────────────────────────────────────────
+
+  The matrix multiplication formula  H_out = A · V  is IDENTICAL before and
+  after fine-tuning. What changed is the NUMBERS INSIDE the weight matrices.
+
+                          Before Fine-tuning    After Fine-tuning (ep 9)
+  ─────────────────────────────────────────────────────────────────────────
+  Same speaker score        ~0.40 – 0.60          ~0.71
+  Different speaker score   ~0.30 – 0.50          ~0.37
+  Score separation (Δμ)     ~0.10                 ~0.34
+  Val EER                   ~45%                   8.25%
+  ─────────────────────────────────────────────────────────────────────────
+
+  Fine-tuning widened the genuine/impostor gap from ~0.10 to ~0.34.
+  That gap is what makes thresholding meaningful and verification possible.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  KEY INSIGHT
+────────────────────────────────────────────────────────────────────────────────
+
+  Every matrix multiplication  (H · W)  is the same mathematical operation
+  before and after fine-tuning. What changes is the numbers inside W.
+
+  Fine-tuning = iteratively adjusting those numbers over 7,500 gradient steps
+  so that when speaker audio passes through the entire chain, the final
+  256-dim direction on the unit sphere encodes IDENTITY, not CONTENT.
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
