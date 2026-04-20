@@ -170,13 +170,13 @@ def load_encoder():
 
 # ── Audio processing helpers ──────────────────────────────────────────────────
 MAX_AUDIO_LEN = 32000  # 2 s × 16 kHz
+import soundfile as sf
 
 def load_audio(uploaded) -> tuple:
-    """Returns (wav_tensor [T], sample_rate, error_str|None)."""
     try:
         raw = uploaded.read() if hasattr(uploaded, "read") else bytes(uploaded)
-        wav, sr = torchaudio.load(io.BytesIO(raw))
-        wav = wav.mean(dim=0)                              # mono
+        data, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
+        wav = torch.from_numpy(data.mean(axis=1))  # mono
         if sr != 16000:
             wav = torchaudio.functional.resample(wav, sr, 16000)
         return wav, 16000, None
